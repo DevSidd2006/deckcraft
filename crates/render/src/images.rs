@@ -13,6 +13,8 @@ const BUDGET: usize = 512 << 20;
 /// header before decoding and again before the conversion to RGBA, which the decoder's own
 /// allocation limit doesn't cover (a grey image converts to four times its decoded size).
 const MAX_RGBA: u64 = 512 << 20;
+const SVG_MAX_BYTES: usize = 32 << 20;
+const SVG_MAX_SIDE: u32 = 4096;
 
 /// Pictures that failed to decode, remembered so they aren't retried every frame: at most this
 /// many, holding at most this many encoded bytes (oldest forgotten first). Larger failed inputs
@@ -130,7 +132,85 @@ fn decode_at(bytes: &[u8], side: u32) -> Option<image::RgbaImage> {
     if crate::metafile::is_metafile(bytes) {
         return crate::metafile::rasterize(bytes, side);
     }
+    if looks_like_svg(bytes) {
+        return decode_svg(bytes, side);
+    }
     decode_raster(bytes, MAX_RGBA)
+}
+
+fn looks_like_svg(bytes: &[u8]) -> bool {
+    let head = bytes.get(..bytes.len().min(4096)).unwrap_or(bytes);
+    let text = std::str::from_utf8(head).ok().map(str::to_ascii_lowercase);
+    text.is_some_and(|s| s.contains("<svg") || s.contains("<?xml"))
+}
+
+fn svg_options() -> resvg::usvg::Options<'static> {
+    resvg::usvg::Options { resources_dir: None, ..resvg::usvg::Options::default() }
+}
+
+fn svg_tree(bytes: &[u8]) -> Option<resvg::usvg::Tree> {
+    if bytes.len() > SVG_MAX_BYTES {
+        return None;
+    }
+    let lower = std::str::from_utf8(bytes).ok()?.to_ascii_lowercase();
+    for forbidden in [
+        "<script",
+        "javascript:",
+        "href=\"http://",
+        "href='http://",
+        "href=\"https://",
+        "href='https://",
+        "href=\"file://",
+        "href='file://",
+        "xlink:href=\"http://",
+        "xlink:href='http://",
+        "xlink:href=\"https://",
+        "xlink:href='https://",
+        "xlink:href=\"file://",
+        "xlink:href='file://",
+    ] {
+        if lower.contains(forbidden) {
+            return None;
+        }
+    }
+    resvg::usvg::Tree::from_data(bytes, &svg_options()).ok()
+}
+
+fn svg_size(bytes: &[u8]) -> Option<(f64, f64)> {
+    let tree = svg_tree(bytes)?;
+    let size = tree.size();
+    let (w, h) = (f64::from(size.width()), f64::from(size.height()));
+    (w.is_finite() && h.is_finite() && w > 0.0 && h > 0.0 && w * h * 4.0 <= MAX_RGBA as f64).then_some((w, h))
+}
+
+fn decode_svg(bytes: &[u8], side: u32) -> Option<image::RgbaImage> {
+    let tree = svg_tree(bytes)?;
+    let size = tree.size();
+    let (w, h) = (f64::from(size.width()), f64::from(size.height()));
+    if !(w.is_finite() && h.is_finite() && w > 0.0 && h > 0.0) {
+        return None;
+    }
+    let scale = f64::from(side.min(SVG_MAX_SIDE)).min(f64::from(SVG_MAX_SIDE)) / w.max(h);
+    let width = (w * scale).round().clamp(1.0, f64::from(SVG_MAX_SIDE)) as u32;
+    let height = (h * scale).round().clamp(1.0, f64::from(SVG_MAX_SIDE)) as u32;
+    if !fits(width, height, MAX_RGBA) {
+        return None;
+    }
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(width, height)?;
+    let transform = resvg::tiny_skia::Transform::from_scale(width as f32 / w as f32, height as f32 / h as f32);
+    resvg::render(&tree, transform, &mut pixmap.as_mut());
+    let mut rgba = pixmap.data().to_vec();
+    for px in rgba.as_chunks_mut::<4>().0 {
+        let a = px[3] as u16;
+        if a == 0 {
+            px[..3].fill(0);
+        } else if a < 255 {
+            for c in &mut px[..3] {
+                *c = ((*c as u16 * 255 + a / 2) / a).min(255) as u8;
+            }
+        }
+    }
+    image::RgbaImage::from_raw(width, height, rgba)
 }
 
 impl Cache {
@@ -182,6 +262,9 @@ fn decode_raster(bytes: &[u8], max: u64) -> Option<image::RgbaImage> {
 pub fn natural_size(bytes: &[u8]) -> Option<(f64, f64)> {
     if crate::metafile::is_metafile(bytes) {
         return None;
+    }
+    if looks_like_svg(bytes) {
+        return svg_size(bytes);
     }
     let (w, h) = image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format().ok()?.into_dimensions().ok()?;
     if w == 0 || h == 0 {
@@ -576,6 +659,43 @@ mod tests {
         let b = decode_for(&good, 64.0, &PictureAdjust::default()).expect("cached");
         assert!(Arc::ptr_eq(&a, &b));
         assert_eq!((a.width(), a.height()), (20, 10));
+    }
+
+    #[test]
+    fn svg_decodes_with_intrinsic_size_and_transparency() {
+        let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="40" height="20">
+            <rect width="40" height="20" fill="#c2185b"/>
+            <circle cx="10" cy="10" r="5" fill="#ffffff"/>
+        </svg>"##;
+        assert_eq!(natural_size(svg), Some((40.0, 20.0)));
+        let img = decode(svg).expect("SVG decodes");
+        assert_eq!(img.dimensions(), (1024, 512));
+        assert_eq!(img.get_pixel(800, 256).0, [194, 24, 91, 255]);
+        assert_eq!(img.get_pixel(0, 0).0, [194, 24, 91, 255]);
+    }
+
+    #[test]
+    fn svg_rendering_supports_viewbox_gradient_and_transform() {
+        let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 10">
+            <defs><linearGradient id="g"><stop offset="0" stop-color="#000000"/><stop offset="1" stop-color="#ffffff"/></linearGradient></defs>
+            <rect width="20" height="10" fill="url(#g)"/>
+            <rect x="2" y="2" width="4" height="4" fill="#ff0000" transform="rotate(45 4 4)"/>
+        </svg>"##;
+        let bytes = Arc::new(svg.to_vec());
+        let pm = decode_for(&bytes, 64.0, &PictureAdjust::default()).expect("SVG renders");
+        assert_eq!((pm.width(), pm.height()), (64, 32));
+        assert!(pm.data().iter().any(|p| p.a != 0));
+    }
+
+    #[test]
+    fn svg_with_scripts_or_external_resources_is_rejected() {
+        for svg in [
+            br##"<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>"##.as_slice(),
+            br##"<svg xmlns="http://www.w3.org/2000/svg"><image href="https://example.com/x.png"/></svg>"##.as_slice(),
+            br##"<svg xmlns="http://www.w3.org/2000/svg" width="0" height="20"/>"##.as_slice(),
+        ] {
+            assert!(decode(svg).is_none(), "unsafe or invalid SVG decoded");
+        }
     }
 
     #[test]
