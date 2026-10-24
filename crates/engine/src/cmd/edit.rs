@@ -70,31 +70,7 @@ fn slides_scope(s: &Session, p: &Value) -> bool {
 }
 
 pub(crate) fn media_of_shapes(shapes: &[Shape], out: &mut Vec<MediaId>) {
-    deckcraft_model::walk(shapes, &mut |s, _| {
-        match &s.kind {
-            deckcraft_model::ShapeKind::Picture { fill } => {
-                out.push(fill.media);
-                out.extend(fill.svg);
-            }
-            deckcraft_model::ShapeKind::Media(m) => {
-                out.push(m.media);
-                if let Some(p) = m.poster {
-                    out.push(p);
-                }
-            }
-            deckcraft_model::ShapeKind::Model3d { media, poster } => {
-                out.push(*media);
-                if let Some(p) = poster {
-                    out.push(*p);
-                }
-            }
-            _ => {}
-        }
-        if let Some(deckcraft_model::Fill::Picture(pf)) = &s.fill {
-            out.push(pf.media);
-            out.extend(pf.svg);
-        }
-    });
+    crate::media_refs::visit::shapes(shapes, &mut |id| out.push(*id));
 }
 
 fn copy_inner(s: &mut Session, p: &Value) -> Result<String> {
@@ -260,33 +236,9 @@ fn remap_media(shapes: &mut [Shape], map: &HashMap<MediaId, MediaId>) {
     if map.is_empty() {
         return;
     }
-    let m = |id: &mut MediaId| {
+    crate::media_refs::visit_mut::shapes(shapes, &mut |id| {
         if let Some(n) = map.get(id) {
             *id = *n;
-        }
-    };
-    walk_mut(shapes, &mut |s| {
-        match &mut s.kind {
-            deckcraft_model::ShapeKind::Picture { fill } => {
-                m(&mut fill.media);
-                if let Some(svg) = fill.svg.as_mut() {
-                    m(svg);
-                }
-            }
-            deckcraft_model::ShapeKind::Media(c) => {
-                m(&mut c.media);
-                if let Some(p) = c.poster.as_mut() {
-                    m(p);
-                }
-            }
-            deckcraft_model::ShapeKind::Opaque { preview: Some(p), .. } => m(p),
-            _ => {}
-        }
-        if let Some(deckcraft_model::Fill::Picture(pf)) = &mut s.fill {
-            m(&mut pf.media);
-            if let Some(svg) = pf.svg.as_mut() {
-                m(svg);
-            }
         }
     });
 }

@@ -159,6 +159,9 @@ pub struct PictureFill {
 pub struct Artistic {
     pub effect: String,
     pub original: MediaId,
+    /// SVG paired with the original picture, restored when the effect is removed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub svg: Option<MediaId>,
 }
 
 /// Picture corrections and colour (Picture Format ▸ Corrections / Color / Transparency).

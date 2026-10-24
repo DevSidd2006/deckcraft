@@ -140,40 +140,44 @@ fn decode_at(bytes: &[u8], side: u32) -> Option<image::RgbaImage> {
 
 fn looks_like_svg(bytes: &[u8]) -> bool {
     let head = bytes.get(..bytes.len().min(4096)).unwrap_or(bytes);
-    let text = std::str::from_utf8(head).ok().map(str::to_ascii_lowercase);
-    text.is_some_and(|s| s.contains("<svg") || s.contains("<?xml"))
+    contains_ascii_case_insensitive(head, b"<svg") || contains_ascii_case_insensitive(head, b"<?xml")
 }
 
 fn svg_options() -> resvg::usvg::Options<'static> {
-    resvg::usvg::Options { resources_dir: None, ..resvg::usvg::Options::default() }
+    static FONTDB: std::sync::OnceLock<Arc<resvg::usvg::fontdb::Database>> = std::sync::OnceLock::new();
+    let fontdb = FONTDB.get_or_init(|| {
+        let mut db = resvg::usvg::fontdb::Database::new();
+        for bytes in deckcraft_fonts::bundled() {
+            db.load_font_data(bytes.to_vec());
+        }
+        db.set_serif_family(deckcraft_fonts::LAST_RESORT_FAMILY);
+        db.set_sans_serif_family(deckcraft_fonts::LAST_RESORT_FAMILY);
+        Arc::new(db)
+    });
+    resvg::usvg::Options {
+        resources_dir: None,
+        image_href_resolver: resvg::usvg::ImageHrefResolver { resolve_data: Box::new(|_, _, _| None), resolve_string: Box::new(|_, _| None) },
+        fontdb: fontdb.clone(),
+        font_family: deckcraft_fonts::LAST_RESORT_FAMILY.to_string(),
+        ..resvg::usvg::Options::default()
+    }
 }
 
 fn svg_tree(bytes: &[u8]) -> Option<resvg::usvg::Tree> {
     if bytes.len() > SVG_MAX_BYTES {
         return None;
     }
-    let lower = std::str::from_utf8(bytes).ok()?.to_ascii_lowercase();
-    for forbidden in [
-        "<script",
-        "javascript:",
-        "href=\"http://",
-        "href='http://",
-        "href=\"https://",
-        "href='https://",
-        "href=\"file://",
-        "href='file://",
-        "xlink:href=\"http://",
-        "xlink:href='http://",
-        "xlink:href=\"https://",
-        "xlink:href='https://",
-        "xlink:href=\"file://",
-        "xlink:href='file://",
-    ] {
-        if lower.contains(forbidden) {
+    std::str::from_utf8(bytes).ok()?;
+    for forbidden in ["<script", "<image", "<feimage", "@font-face", "font-face-uri", "javascript:", "url(http", "url(https", "url(file"] {
+        if contains_ascii_case_insensitive(bytes, forbidden.as_bytes()) {
             return None;
         }
     }
     resvg::usvg::Tree::from_data(bytes, &svg_options()).ok()
+}
+
+fn contains_ascii_case_insensitive(bytes: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty() && bytes.windows(needle.len()).any(|window| window.iter().zip(needle).all(|(a, b)| a.eq_ignore_ascii_case(b)))
 }
 
 fn svg_size(bytes: &[u8]) -> Option<(f64, f64)> {
@@ -688,10 +692,22 @@ mod tests {
     }
 
     #[test]
+    fn svg_detection_survives_a_cut_utf8_prefix_and_text_renders() {
+        let mut svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="80" height="40"><desc>"#.to_vec();
+        svg.extend(std::iter::repeat_n(b' ', 4095 - svg.len()));
+        svg.extend_from_slice("é</desc><text x=\"4\" y=\"30\" font-family=\"Arial,Helvetica,Arial\" font-size=\"28\">A</text></svg>".as_bytes());
+        assert!(looks_like_svg(&svg));
+        let img = decode(&svg).expect("SVG text decodes");
+        assert!(img.pixels().any(|p| p[3] > 0), "bundled font draws the label");
+    }
+
+    #[test]
     fn svg_with_scripts_or_external_resources_is_rejected() {
         for svg in [
             br##"<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>"##.as_slice(),
             br##"<svg xmlns="http://www.w3.org/2000/svg"><image href="https://example.com/x.png"/></svg>"##.as_slice(),
+            br##"<svg xmlns="http://www.w3.org/2000/svg"><image href="relative.png"/></svg>"##.as_slice(),
+            br##"<svg xmlns="http://www.w3.org/2000/svg"><image href="file:///tmp/picture.png"/></svg>"##.as_slice(),
             br##"<svg xmlns="http://www.w3.org/2000/svg" width="0" height="20"/>"##.as_slice(),
         ] {
             assert!(decode(svg).is_none(), "unsafe or invalid SVG decoded");

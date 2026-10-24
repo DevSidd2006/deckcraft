@@ -1119,6 +1119,7 @@ fn picture_reset(s: &mut Session, p: &Value) -> Result<Value> {
             fill.alpha = None;
             if let Some(a) = fill.artistic.take() {
                 fill.media = a.original;
+                fill.svg = a.svg;
             }
         }
         sh.effects = None;
