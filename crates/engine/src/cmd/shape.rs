@@ -5,7 +5,7 @@ use std::collections::HashMap;
 
 use deckcraft_color::{ColorTransform, Rgba, SchemeSlot};
 use deckcraft_model::style::{Dash, Glow, Gradient, GradientShape, GradientStop, LineEnd, PatternFill, PictureFill, PictureMode, Reflection, Shadow};
-use deckcraft_model::{ColorRef, Effects, Fill, Geom, Line, ShapeStyle};
+use deckcraft_model::{ColorRef, Effects, Fill, Geom, Line, ShapeId, ShapeStyle};
 use serde_json::{Value, json};
 
 use super::{
@@ -13,6 +13,19 @@ use super::{
     has_slide, id_param, ok, str_param, targets, usize_param, with_param, xfrm_of,
 };
 use crate::{Result, Session};
+
+mod appearance;
+mod freeform;
+mod picture;
+mod size;
+
+pub(crate) use appearance::gradient_param;
+pub use appearance::quick_style_for;
+use appearance::{adjust, change, effects, fill, line, picture_props, quick_style, smooth_corners};
+pub use freeform::freeform_path;
+use freeform::{connect, freeform, ink_to_shape, sites};
+use picture::{crop, media_options, picture_adjust, picture_change, picture_reset};
+use size::{clamp_pos, clamp_side, flip, rotate, size_position};
 
 pub fn specs() -> Vec<CommandSpec> {
     vec![
@@ -174,17 +187,6 @@ pub fn specs() -> Vec<CommandSpec> {
     ]
 }
 
-/// Keeps a side length in `0..=MAX_PT` so a huge value cannot exhaust memory when rendering.
-/// An overflow to infinity lands on the limit; NaN becomes 0.
-fn clamp_side(v: f64) -> f64 {
-    if v.is_nan() { 0.0 } else { v.clamp(0.0, MAX_PT) }
-}
-
-/// Keeps a coordinate within `±POS_LIMIT`.
-fn clamp_pos(v: f64) -> f64 {
-    if v.is_nan() { 0.0 } else { v.clamp(-POS_LIMIT, POS_LIMIT) }
-}
-
 fn move_by(s: &mut Session, p: &Value) -> Result<Value> {
     let (dx, dy) = (f64_param(p, "dx"), f64_param(p, "dy"));
     let (ax, ay) = (f64_param(p, "x"), f64_param(p, "y"));
@@ -242,768 +244,90 @@ fn set_bounds(s: &mut Session, p: &Value) -> Result<Value> {
     })
 }
 
-const SIZE_POS: &str = "shape.sizePosition";
-/// Smallest and largest side the dialog will write, in points (220 in).
-const MIN_PT: f64 = 0.01;
-const MAX_PT: f64 = 15_840.0;
-const POS_LIMIT: f64 = 100_000.0;
-const MAX_SCALE: f64 = 10_000.0;
-
-#[derive(Clone, Copy)]
-struct SizeSpec {
-    x: Option<f64>,
-    y: Option<f64>,
-    w: Option<f64>,
-    h: Option<f64>,
-    rot: Option<f64>,
-    scale_w: Option<f64>,
-    scale_h: Option<f64>,
-    lock: bool,
-}
-
-impl SizeSpec {
-    fn width_set(self) -> bool {
-        self.w.is_some() || self.scale_w.is_some()
+/// The fill a `shape.fill` request sets: `Some(None)` clears it, `Some(Some(_))` sets it, and `None`
+/// leaves it as it is.
+fn requested_fill(s: &mut Session, p: &Value) -> Result<Option<Option<Fill>>> {
+    if bool_or(p, "reset", false) {
+        return Ok(Some(None));
     }
-    fn height_set(self) -> bool {
-        self.h.is_some() || self.scale_h.is_some()
+    if bool_or(p, "none", false) {
+        return Ok(Some(Some(Fill::None)));
     }
-    fn any(self) -> bool {
-        self.x.is_some() || self.y.is_some() || self.width_set() || self.height_set() || self.rot.is_some()
+    if let Some(c) = color_param(p, "color") {
+        return Ok(Some(Some(Fill::solid(c))));
     }
-}
-
-fn finite_key(p: &Value, key: &str) -> Result<Option<f64>> {
-    match p.get(key) {
-        None | Some(Value::Null) => Ok(None),
-        Some(v) => match v.as_f64() {
-            Some(n) if n.is_finite() => Ok(Some(n)),
-            _ => Err(bad(SIZE_POS, format!("`{key}` must be a finite number"))),
-        },
+    if let Some(g) = p.get("gradient") {
+        let gradient = gradient_param(g).ok_or_else(|| bad("shape.fill", "gradient needs at least two `stops`: [[0, \"#fff\"], [1, \"#000\"]]"))?;
+        return Ok(Some(Some(Fill::Gradient(gradient))));
     }
-}
-
-fn in_range(v: Option<f64>, key: &str, lo: f64, hi: f64) -> Result<Option<f64>> {
-    if let Some(n) = v
-        && !(lo..=hi).contains(&n)
-    {
-        return Err(bad(SIZE_POS, format!("`{key}` is out of range")));
-    }
-    Ok(v)
-}
-
-fn size_spec(p: &Value) -> Result<SizeSpec> {
-    let lock = match p.get("lockAspect") {
-        None | Some(Value::Null) => false,
-        Some(Value::Bool(b)) => *b,
-        Some(_) => return Err(bad(SIZE_POS, "`lockAspect` must be true or false")),
-    };
-    Ok(SizeSpec {
-        x: in_range(finite_key(p, "x")?, "x", -POS_LIMIT, POS_LIMIT)?,
-        y: in_range(finite_key(p, "y")?, "y", -POS_LIMIT, POS_LIMIT)?,
-        w: in_range(finite_key(p, "w")?, "w", MIN_PT, MAX_PT)?,
-        h: in_range(finite_key(p, "h")?, "h", MIN_PT, MAX_PT)?,
-        rot: finite_key(p, "rot")?,
-        scale_w: in_range(finite_key(p, "scaleW")?, "scaleW", f64::MIN_POSITIVE, MAX_SCALE)?,
-        scale_h: in_range(finite_key(p, "scaleH")?, "scaleH", f64::MIN_POSITIVE, MAX_SCALE)?,
-        lock,
-    })
-}
-
-fn norm_deg(r: f64) -> f64 {
-    let r = r % 360.0;
-    if r < 0.0 { r + 360.0 } else { r }
-}
-
-/// Width wins when both sides are set with the aspect locked, matching `shape.resize`.
-fn apply_size(x: &mut deckcraft_geom::Xfrm, spec: SizeSpec) {
-    let ar = if x.h > 0.0 { x.w / x.h } else { 1.0 };
-    let mut nw = x.w;
-    let mut nh = x.h;
-    if let Some(p) = spec.scale_w {
-        nw = x.w * p / 100.0;
-    }
-    if let Some(p) = spec.scale_h {
-        nh = x.h * p / 100.0;
-    }
-    if let Some(w) = spec.w {
-        nw = w;
-    }
-    if let Some(h) = spec.h {
-        nh = h;
-    }
-    if spec.lock && (spec.width_set() || spec.height_set()) {
-        if spec.width_set() {
-            nh = if ar > 0.0 { nw / ar } else { nh };
-        } else {
-            nw = nh * ar;
-        }
-    }
-    x.w = nw.clamp(MIN_PT, MAX_PT);
-    x.h = nh.clamp(MIN_PT, MAX_PT);
-    if let Some(px) = spec.x {
-        x.x = px;
-    }
-    if let Some(py) = spec.y {
-        x.y = py;
-    }
-    if let Some(r) = spec.rot {
-        x.rot = norm_deg(r);
-    }
-}
-
-fn size_position(s: &mut Session, p: &Value) -> Result<Value> {
-    let spec = size_spec(p)?;
-    if !spec.any() {
-        let (x, y, w, h, rot) = {
-            let st = s.doc()?;
-            let id = targets(s, p)?.first().copied().ok_or_else(|| bad(SIZE_POS, "nothing selected"))?;
-            let sh = st.shape(id).ok_or_else(|| bad(SIZE_POS, "no such shape"))?;
-            let x = xfrm_of(&st.doc, &st.selection, sh);
-            (x.x, x.y, x.w, x.h, x.rot)
-        };
-        s.ui_requests.push(crate::UiRequest::Dialog {
-            id: "sizePosition".into(),
-            params: json!({"x": x, "y": y, "w": w, "h": h, "rot": rot, "scaleW": 100.0, "scaleH": 100.0, "lockAspect": false}),
-        });
-        return Ok(Value::Null);
-    }
-    let changed = {
-        let ids = targets(s, p)?;
-        let st = s.doc()?;
-        let free: Vec<_> = ids.iter().copied().filter(|id| !st.shape(*id).is_some_and(|sh| sh.locked)).collect::<Vec<_>>();
-        if !ids.is_empty() && free.is_empty() {
-            return Err(bad(SIZE_POS, "the object is locked"));
-        }
-        free.iter().any(|id| {
-            st.shape(*id).is_some_and(|sh| {
-                let mut x = xfrm_of(&st.doc, &st.selection, sh);
-                let before = x;
-                apply_size(&mut x, spec);
-                x != before
-            })
-        })
-    };
-    if !changed {
-        return Ok(Value::Null);
-    }
-    edit_geometry(s, p, SIZE_POS, |sh| {
-        if let Some(x) = sh.xfrm.as_mut() {
-            apply_size(x, spec);
-        }
-        Ok(())
-    })
-}
-
-fn rotate(s: &mut Session, p: &Value) -> Result<Value> {
-    // A trackpad twist sends many small steps. `gesture: move` keeps them as one undo;
-    // `gesture: end` commits that step and does not rotate again.
-    if p.get("gesture").and_then(Value::as_str) == Some("end") {
-        s.commit_named("Rotation");
-        return Ok(json!({}));
-    }
-    if p.get("gesture").and_then(Value::as_str) == Some("move") {
-        s.begin("Rotation");
-    }
-    let (abs, by) = (f64_param(p, "deg"), f64_param(p, "by"));
-    edit_geometry(s, p, "shape.rotate", |sh| {
-        if let Some(x) = sh.xfrm.as_mut() {
-            let r = abs.unwrap_or(x.rot) + by.unwrap_or(0.0);
-            x.rot = ((r % 360.0) + 360.0) % 360.0;
-        }
-        Ok(())
-    })
-}
-
-fn flip(s: &mut Session, p: &Value) -> Result<Value> {
-    let v = str_param(p, "axis").unwrap_or("horizontal").starts_with('v');
-    edit_geometry(s, p, "shape.flip", |sh| {
-        if let Some(x) = sh.xfrm.as_mut() {
-            if v {
-                x.flip_v = !x.flip_v;
-            } else {
-                x.flip_h = !x.flip_h;
-            }
-            // `Xfrm::affine` flips first and rotates second; a true mirror also negates the rotation.
-            x.rot = (360.0 - x.rot_norm()) % 360.0;
-        }
-        Ok(())
-    })
-}
-
-fn adjust(s: &mut Session, p: &Value) -> Result<Value> {
-    let i = usize_param(p, "index").unwrap_or(0).min(16);
-    let v = f64_param(p, "value").ok_or_else(|| bad("shape.adjust", "missing `value`"))?;
-    edit_geometry(s, p, "shape.adjust", |sh| {
-        if let Geom::Preset { name, adj } = &mut sh.geom {
-            let defaults = deckcraft_geom::preset::info(name).map(|x| x.defaults).unwrap_or(&[]);
-            while adj.len() <= i {
-                let k = adj.len();
-                adj.push(defaults.get(k).copied().unwrap_or(0.0));
-            }
-            if let Some(slot) = adj.get_mut(i) {
-                *slot = v;
-            }
-        }
-        Ok(())
-    })
-}
-
-/// Rectangles and rounded rectangles become custom geometry whose corners are smoothed
-/// ([`deckcraft_geom::squircle`]); the radius is the rounded rectangle's own unless `radius` says.
-fn smooth_corners(s: &mut Session, p: &Value) -> Result<Value> {
-    const CMD: &str = "shape.smoothCorners";
-    let smoothing =
-        f64_param(p, "smoothing").filter(|v| v.is_finite()).ok_or_else(|| bad(CMD, "missing `smoothing` (0–100)"))?.clamp(0.0, 100.0) / 100.0;
-    let radius = f64_param(p, "radius").filter(|v| v.is_finite()).map(|v| v.max(0.0));
-    edit_geometry(s, p, CMD, |sh| {
-        let Some(x) = sh.xfrm else { return Err(bad(CMD, "the shape has no size of its own")) };
-        let ss = x.w.min(x.h).max(0.0);
-        let own = match &sh.geom {
-            Geom::Preset { name, adj } if name == "roundRect" => Some(ss * adj.first().copied().unwrap_or(16667.0).clamp(0.0, 50000.0) / 100000.0),
-            Geom::Preset { name, .. } if name == "rect" => Some(ss * 16667.0 / 100000.0),
-            _ => None,
-        };
-        // A custom outline qualifies only when it is a squircle this command drew with `radius`
-        // (re-smoothing as the slider moves), never an arbitrary freeform.
-        let custom = match (&sh.geom, radius) {
-            (Geom::Custom { paths }, Some(r)) => match paths.as_slice() {
-                [only] => (0..=100).any(|k| deckcraft_geom::squircle::path_d(only.w, only.h, r, f64::from(k) / 100.0) == only.d),
-                _ => false,
-            },
-            _ => false,
-        };
-        let r = match (radius, own) {
-            (Some(r), _) if own.is_some() || custom => r,
-            (None, Some(r)) => r,
-            _ => return Err(bad(CMD, "only rectangles, rounded rectangles and shapes already smoothed with this `radius` can be smoothed")),
-        };
-        sh.geom = Geom::Custom {
-            paths: vec![deckcraft_model::CustomPath {
-                w: x.w,
-                h: x.h,
-                d: deckcraft_geom::squircle::path_d(x.w, x.h, r, smoothing),
-                ..Default::default()
-            }],
-        };
-        Ok(())
-    })
-}
-
-fn change(s: &mut Session, p: &Value) -> Result<Value> {
-    let name = str_param(p, "preset").ok_or_else(|| bad("shape.change", "missing `preset`"))?;
-    let info = deckcraft_geom::preset::info(name).ok_or_else(|| bad("shape.change", format!("unknown preset `{name}`")))?;
-    edit_geometry(s, p, "shape.change", |sh| {
-        sh.geom = Geom::preset(info.name);
-        Ok(())
-    })
-}
-
-/// `{stops: [[pos 0–1, color], …], kind?: linear|radial|rectangular|path, angle?: deg (linear),
-/// focus?: [l, t, r, b] fractions (radial/rectangular/path: where the first stop sits),
-/// rotateWithShape?}`.
-pub(crate) fn gradient_param(v: &Value) -> Option<Gradient> {
-    let stops: Vec<GradientStop> = v
-        .get("stops")?
-        .as_array()?
-        .iter()
-        .filter_map(|s| {
-            let a = s.as_array()?;
-            Some(GradientStop { pos: a.first()?.as_f64()?.clamp(0.0, 1.0), color: color_value(a.get(1)?)? })
-        })
-        .collect();
-    if stops.len() < 2 {
-        return None;
-    }
-    let focus = v
-        .get("focus")
-        .and_then(Value::as_array)
-        .and_then(|a| {
-            let f = |i: usize| a.get(i).and_then(Value::as_f64).filter(|x| x.is_finite()).map(|x| x.clamp(0.0, 1.0));
-            Some([f(0)?, f(1)?, f(2)?, f(3)?])
-        })
-        .unwrap_or([0.5, 0.5, 0.5, 0.5]);
-    let mut stops = stops;
-    stops.sort_by(|a, b| a.pos.total_cmp(&b.pos));
-    let path = |p: &str| GradientShape::Path { path: p.into(), focus };
-    let shape = match v.get("kind").and_then(Value::as_str) {
-        Some("radial" | "circle") => path("circle"),
-        Some("rectangular" | "rect") => path("rect"),
-        Some("path" | "shape") => path("shape"),
-        _ => GradientShape::Linear {
-            angle: v.get("angle").and_then(Value::as_f64).filter(|a| a.is_finite()).unwrap_or(90.0).rem_euclid(360.0),
-            scaled: false,
-        },
-    };
-    Some(Gradient { tile: [0.0; 4], stops, shape, rotate_with_shape: v.get("rotateWithShape").and_then(Value::as_bool).unwrap_or(true) })
-}
-
-/// Fill and outline apply to a group's visible members as well as its container. Other edits
-/// (notably geometry) still target only the selected shape. The whole traversal stays in one edit.
-fn edit_group_appearance(s: &mut Session, p: &Value, cmd: &str, f: impl Fn(&mut deckcraft_model::Shape) -> Result<()>) -> Result<Value> {
-    fn apply(sh: &mut deckcraft_model::Shape, depth: usize, f: &dyn Fn(&mut deckcraft_model::Shape) -> Result<()>) -> Result<()> {
-        if depth > 64 {
-            return Ok(());
-        }
-        f(sh)?;
-        if let Some(children) = sh.children_mut() {
-            for child in children {
-                apply(child, depth + 1, f)?;
-            }
-        }
-        Ok(())
-    }
-    edit_shapes(s, p, cmd, |sh| apply(sh, 0, &f))
-}
-
-fn fill(s: &mut Session, p: &Value) -> Result<Value> {
-    let new_fill: Option<Option<Fill>> = if bool_or(p, "reset", false) {
-        Some(None)
-    } else if bool_or(p, "none", false) {
-        Some(Some(Fill::None))
-    } else if let Some(c) = color_param(p, "color") {
-        Some(Some(Fill::solid(c)))
-    } else if let Some(g) = p.get("gradient") {
-        Some(Some(Fill::Gradient(
-            gradient_param(g).ok_or_else(|| bad("shape.fill", "gradient needs at least two `stops`: [[0, \"#fff\"], [1, \"#000\"]]"))?,
-        )))
-    } else if let Some(pt) = p.get("pattern") {
-        Some(Some(Fill::Pattern(PatternFill {
+    if let Some(pt) = p.get("pattern") {
+        return Ok(Some(Some(Fill::Pattern(PatternFill {
             preset: pt.get("preset").and_then(Value::as_str).unwrap_or("pct50").to_string(),
             fg: pt.get("fg").and_then(color_value).unwrap_or(ColorRef::scheme(SchemeSlot::Accent1)),
             bg: pt.get("bg").and_then(color_value).unwrap_or(ColorRef::scheme(SchemeSlot::Bg1)),
-        })))
-    } else if p.get("picture").is_some() {
+        }))));
+    }
+    if p.get("picture").is_some() {
         let (name, bytes) = super::insert::media_bytes(&with_param(p, "data", p.get("picture").cloned().unwrap_or_default()), "shape.fill")?;
         let ct = super::insert::content_type(&name, &bytes);
         let media = s.edit(|doc, _| doc.add_media(&name, ct, bytes).ok_or_else(|| bad("shape.fill", NO_ID_SPACE)))?;
-        Some(Some(Fill::Picture(PictureFill { media, ..Default::default() })))
-    } else {
-        None
-    };
-    let transparency = f64_param(p, "transparency");
-    let pic_props = p.get("pictureProps").filter(|v| v.is_object());
-    if new_fill.is_none() && transparency.is_none() && pic_props.is_none() {
-        return Err(bad("shape.fill", "give `color`, `none`, `gradient`, `pattern`, `picture`, `pictureProps`, `transparency` or `reset`"));
+        return Ok(Some(Some(Fill::Picture(PictureFill { media, ..Default::default() }))));
     }
-    // Transparency on an inherited (style) fill needs the effective colour.
+    Ok(None)
+}
+
+/// The effective fill of each targeted shape, for a transparency change on an inherited (style) fill.
+fn inherited_fills(s: &Session, p: &Value) -> Result<HashMap<ShapeId, Option<Fill>>> {
     let st = s.doc()?;
-    let ctx_fill = {
-        let ctx = super::text::ctx_for(&st.doc, &st.selection);
-        let mut fills = HashMap::new();
-        for id in targets(s, p)? {
-            if let Some(sh) = st.shape(id) {
-                deckcraft_model::walk(std::slice::from_ref(sh), &mut |sh, _| {
-                    let fill = ctx.as_ref().and_then(|c| {
-                        let (f, ph) = deckcraft_model::resolve::fill(c, sh);
-                        f.map(|f| match f {
-                            Fill::Solid { color } => Fill::solid(ColorRef::rgb(c.color(&color, ph))),
-                            other => other,
-                        })
-                    });
-                    fills.insert(sh.id, fill);
+    let ctx = super::text::ctx_for(&st.doc, &st.selection);
+    let mut fills = HashMap::new();
+    for id in targets(s, p)? {
+        if let Some(sh) = st.shape(id) {
+            deckcraft_model::walk(std::slice::from_ref(sh), &mut |sh, _| {
+                let fill = ctx.as_ref().and_then(|c| {
+                    let (f, ph) = deckcraft_model::resolve::fill(c, sh);
+                    f.map(|f| match f {
+                        Fill::Solid { color } => Fill::solid(ColorRef::rgb(c.color(&color, ph))),
+                        other => other,
+                    })
                 });
-            }
-        }
-        fills
-    };
-    edit_group_appearance(s, p, "shape.fill", |sh| {
-        if let Some(f) = &new_fill {
-            sh.fill.clone_from(f);
-        }
-        if let (Some(pp), Some(Fill::Picture(pf))) = (pic_props, sh.fill.as_mut()) {
-            picture_props(pf, pp);
-        }
-        if let (Some(t), Some(Fill::Picture(pf))) = (transparency, sh.fill.as_mut()) {
-            let a = 1.0 - t.clamp(0.0, 1.0);
-            pf.alpha = (a < 1.0).then_some(a);
-            return Ok(());
-        }
-        if let Some(t) = transparency {
-            let base = sh.fill.clone().or_else(|| ctx_fill.get(&sh.id).cloned().flatten());
-            if let Some(Fill::Solid { mut color }) = base {
-                color.mods.retain(|m| !matches!(m, ColorTransform::Alpha(_)));
-                if t > 0.0 {
-                    color.mods.push(ColorTransform::Alpha(((1.0 - t.clamp(0.0, 1.0)) * 100_000.0).round() as i32));
-                }
-                sh.fill = Some(Fill::Solid { color });
-            }
-        }
-        Ok(())
-    })
-}
-
-/// Applies Format Shape ▸ Picture or texture fill options to a picture fill.
-fn picture_props(pf: &mut PictureFill, pp: &Value) {
-    let f = |k: &str| pp.get(k).and_then(Value::as_f64).filter(|v| v.is_finite());
-    if let Some(up) = pp.get("rotateWithShape").and_then(Value::as_bool) {
-        pf.upright = !up;
-    }
-    match pp.get("tile").and_then(Value::as_bool) {
-        Some(true) if !matches!(pf.mode, PictureMode::Tile { .. }) => {
-            pf.mode = PictureMode::Tile { tx: 0.0, ty: 0.0, sx: 1.0, sy: 1.0, flip: "none".into(), align: "tl".into() };
-        }
-        Some(false) if !matches!(pf.mode, PictureMode::Stretch { .. }) => pf.mode = PictureMode::default(),
-        _ => {}
-    }
-    match &mut pf.mode {
-        PictureMode::Tile { tx, ty, sx, sy, flip, align } => {
-            if let Some(v) = f("offsetX") {
-                *tx = v.clamp(-4000.0, 4000.0);
-            }
-            if let Some(v) = f("offsetY") {
-                *ty = v.clamp(-4000.0, 4000.0);
-            }
-            if let Some(v) = f("scaleX") {
-                *sx = v.clamp(0.01, 10.0);
-            }
-            if let Some(v) = f("scaleY") {
-                *sy = v.clamp(0.01, 10.0);
-            }
-            if let Some(m) = pp.get("mirror").and_then(Value::as_str).filter(|m| matches!(*m, "none" | "x" | "y" | "xy")) {
-                *flip = m.to_string();
-            }
-            if let Some(a) =
-                pp.get("align").and_then(Value::as_str).filter(|a| matches!(*a, "tl" | "t" | "tr" | "l" | "ctr" | "r" | "bl" | "b" | "br"))
-            {
-                *align = a.to_string();
-            }
-        }
-        PictureMode::Stretch { fill_rect } => {
-            if let Some(arr) = pp.get("stretch").and_then(Value::as_array) {
-                for (slot, v) in fill_rect.iter_mut().zip(arr) {
-                    if let Some(v) = v.as_f64().filter(|v| v.is_finite()) {
-                        *slot = v.clamp(-10.0, 0.99);
-                    }
-                }
-            }
+                fills.insert(sh.id, fill);
+            });
         }
     }
+    Ok(fills)
 }
 
-fn line_end(v: &str) -> Option<LineEnd> {
-    if v == "none" { None } else { Some(LineEnd { kind: v.to_string(), w: "med".into(), len: "med".into() }) }
-}
-
-fn line(s: &mut Session, p: &Value) -> Result<Value> {
-    let reset = bool_or(p, "reset", false);
-    let none = bool_or(p, "none", false);
-    let color = color_param(p, "color");
-    let width = f64_param(p, "width").map(|w| w.clamp(0.0, 1584.0));
-    let dash = str_param(p, "dash").map(|d| Dash::Preset { name: d.to_string() });
-    let head = str_param(p, "head").map(line_end);
-    let tail = str_param(p, "tail").map(line_end);
-    let cap = str_param(p, "cap").map(|c| match c {
-        "round" => deckcraft_model::style::LineCap::Round,
-        "square" => deckcraft_model::style::LineCap::Square,
-        _ => deckcraft_model::style::LineCap::Flat,
-    });
-    let compound = str_param(p, "compound").map(|c| match c {
-        "double" => deckcraft_model::style::Compound::Double,
-        "thickThin" => deckcraft_model::style::Compound::ThickThin,
-        "thinThick" => deckcraft_model::style::Compound::ThinThick,
-        "triple" => deckcraft_model::style::Compound::Triple,
-        _ => deckcraft_model::style::Compound::Single,
-    });
-    let end_size = |k: &str| str_param(p, k).filter(|v| matches!(*v, "sm" | "med" | "lg")).map(str::to_string);
-    let (head_size, tail_size) = (end_size("headSize"), end_size("tailSize"));
-    let join = str_param(p, "join").map(|c| match c {
-        "bevel" => deckcraft_model::style::LineJoin::Bevel,
-        "miter" => deckcraft_model::style::LineJoin::Miter,
-        _ => deckcraft_model::style::LineJoin::Round,
-    });
-    edit_group_appearance(s, p, "shape.line", |sh| {
-        if reset {
-            sh.line = None;
-            return Ok(());
-        }
-        let l = sh.line.get_or_insert_with(Line::default);
-        if none {
-            l.fill = Some(Fill::None);
-        }
-        if let Some(c) = &color {
-            l.fill = Some(Fill::solid(c.clone()));
-        }
-        if width.is_some() {
-            l.width = width;
-            if l.fill.is_none() || matches!(l.fill, Some(Fill::None)) && !none {
-                l.fill = Some(Fill::solid(ColorRef::scheme(SchemeSlot::Tx1)));
-            }
-        }
-        if dash.is_some() {
-            l.dash.clone_from(&dash);
-        }
-        let keep_size = |old: &Option<LineEnd>, new: &Option<LineEnd>| {
-            new.clone().map(|mut n| {
-                if let Some(o) = old {
-                    n.w.clone_from(&o.w);
-                    n.len.clone_from(&o.len);
-                }
-                n
-            })
-        };
-        if let Some(h) = &head {
-            l.head = keep_size(&l.head, h);
-        }
-        if let Some(t) = &tail {
-            l.tail = keep_size(&l.tail, t);
-        }
-        if cap.is_some() {
-            l.cap = cap;
-        }
-        if join.is_some() {
-            l.join = join;
-        }
-        if compound.is_some() {
-            l.compound = compound;
-        }
-        // Arrowhead size (width and length together), kept when the kind changes.
-        for (end, size) in [(&mut l.head, &head_size), (&mut l.tail, &tail_size)] {
-            if let (Some(e), Some(sz)) = (end.as_mut(), size) {
-                e.w.clone_from(sz);
-                e.len.clone_from(sz);
-            }
-        }
-        Ok(())
-    })
-}
-
-fn shadow_preset(v: &Value) -> Option<Option<Shadow>> {
-    let black = |a: i32| ColorRef::rgb(Rgba::BLACK).with(ColorTransform::Alpha(a));
-    let base = |inner: bool| Shadow {
-        color: black(40000),
-        blur: 4.0,
-        dist: 3.0,
-        dir: 45.0,
-        inner,
-        sx: 1.0,
-        sy: 1.0,
-        kx: 0.0,
-        ky: 0.0,
-        align: "tl".into(),
-        rotate_with_shape: false,
-    };
-    match v {
-        Value::String(s) => Some(match s.as_str() {
-            "none" => None,
-            "inner" => Some(base(true)),
-            "perspective" => Some(Shadow { sy: 0.23, kx: -1200000.0 / 60000.0, dir: 90.0, dist: 0.0, blur: 6.0, align: "bl".into(), ..base(false) }),
-            "bottom" => Some(Shadow { dir: 90.0, ..base(false) }),
-            "center" => Some(Shadow { dist: 0.0, blur: 8.0, ..base(false) }),
-            _ => Some(base(false)),
-        }),
-        Value::Object(o) => Some(Some(Shadow {
-            color: o.get("color").and_then(color_value).unwrap_or(black(40000)),
-            blur: o.get("blur").and_then(Value::as_f64).unwrap_or(4.0).clamp(0.0, 200.0),
-            dist: o.get("dist").and_then(Value::as_f64).unwrap_or(3.0).clamp(0.0, 200.0),
-            dir: o.get("dir").and_then(Value::as_f64).unwrap_or(45.0),
-            inner: o.get("inner").and_then(Value::as_bool).unwrap_or(false),
-            ..base(false)
-        })),
-        _ => None,
+/// Applies a `shape.fill` request to one shape: the fill, then its picture options, then transparency.
+fn apply_fill(
+    sh: &mut deckcraft_model::Shape,
+    new_fill: Option<&Option<Fill>>,
+    pic_props: Option<&Value>,
+    transparency: Option<f64>,
+    inherited: &HashMap<ShapeId, Option<Fill>>,
+) -> Result<()> {
+    if let Some(f) = new_fill {
+        sh.fill.clone_from(f);
     }
-}
-
-fn effects(s: &mut Session, p: &Value) -> Result<Value> {
-    let reset = bool_or(p, "reset", false);
-    let shadow = p.get("shadow").and_then(shadow_preset);
-    let glow: Option<Option<Glow>> = p.get("glow").map(|g| match g {
-        Value::Object(o) => Some(Glow {
-            color: o.get("color").and_then(color_value).unwrap_or(ColorRef::scheme(SchemeSlot::Accent1).with(ColorTransform::Alpha(40000))),
-            radius: o.get("radius").and_then(Value::as_f64).unwrap_or(8.0).clamp(0.0, 150.0),
-        }),
-        Value::Number(n) => Some(Glow {
-            color: ColorRef::scheme(SchemeSlot::Accent1).with(ColorTransform::Alpha(40000)),
-            radius: n.as_f64().unwrap_or(8.0).clamp(0.0, 150.0),
-        }),
-        _ => None,
-    });
-    let soft = p.get("softEdges").map(|v| v.as_f64().filter(|x| *x > 0.0).map(|x| x.min(100.0)));
-    let refl = str_param(p, "reflection").map(|r| match r {
-        "none" => None,
-        "half" => Some(Reflection { blur: 0.5, start_alpha: 0.5, end_alpha: 0.0, end_pos: 0.55, dist: 4.0 }),
-        "full" => Some(Reflection { blur: 0.5, start_alpha: 0.5, end_alpha: 0.0, end_pos: 0.9, dist: 4.0 }),
-        _ => Some(Reflection { blur: 0.5, start_alpha: 0.5, end_alpha: 0.0, end_pos: 0.35, dist: 0.0 }),
-    });
-    let three_d = p.get("threeD").filter(|v| v.is_object());
-    let bevel = str_param(p, "bevel").map(|b| if b == "none" { None } else { Some(b.to_string()) });
-    let shadow_props = p.get("shadowProps").filter(|v| v.is_object()).cloned();
-    let glow_props = p.get("glowProps").filter(|v| v.is_object()).cloned();
-    let refl_props = p.get("reflectionProps").filter(|v| v.is_object()).cloned();
-    edit_shapes(s, p, "shape.effects", |sh| {
-        if reset {
-            sh.effects = None;
-            return Ok(());
-        }
-        let e = sh.effects.get_or_insert_with(Effects::default);
-        if let Some(sw) = &shadow {
-            match sw {
-                Some(x) if x.inner => {
-                    e.inner_shadow = Some(x.clone());
-                    e.outer_shadow = None;
-                }
-                Some(x) => {
-                    e.outer_shadow = Some(x.clone());
-                    e.inner_shadow = None;
-                }
-                None => {
-                    e.outer_shadow = None;
-                    e.inner_shadow = None;
-                }
-            }
-        }
-        if let Some(g) = &glow {
-            e.glow.clone_from(g);
-        }
-        if let Some(sf) = soft {
-            e.soft_edge = sf;
-        }
-        if let Some(r) = &refl {
-            e.reflection.clone_from(r);
-        }
-        if bevel.is_some() || three_d.is_some() {
-            let mut s3 = e.raw3d.as_deref().map(super::three_d::Shape3d::parse).unwrap_or_default();
-            if let Some(b) = &bevel {
-                s3.apply(&json!({"bevelTop": b.as_deref().unwrap_or("none")}));
-            }
-            if let Some(t) = three_d {
-                if t.get("reset").and_then(Value::as_bool) == Some(true) {
-                    s3 = super::three_d::Shape3d::default();
-                }
-                s3.apply(t);
-            }
-            super::three_d::store(e, &s3);
-        }
-        if let Some(v) = &shadow_props {
-            let slot = if e.inner_shadow.is_some() { &mut e.inner_shadow } else { &mut e.outer_shadow };
-            let mut x = slot.take().or_else(|| shadow_preset(&json!("outer")).flatten()).ok_or_else(|| bad("shape.effects", "no shadow preset"))?;
-            if let Some(c) = v.get("color").and_then(color_value) {
-                let a = x.color.alpha();
-                x.color = with_alpha(c, a);
-            }
-            if let Some(t) = num(v, "transparency") {
-                x.color = with_alpha(x.color.clone(), 1.0 - t.clamp(0.0, 1.0));
-            }
-            if let Some(b) = num(v, "blur") {
-                x.blur = b.clamp(0.0, 100.0);
-            }
-            if let Some(d) = num(v, "dist") {
-                x.dist = d.clamp(0.0, 200.0);
-            }
-            if let Some(d) = num(v, "dir") {
-                x.dir = d.rem_euclid(360.0);
-            }
-            *slot = Some(x);
-        }
-        if let Some(v) = &glow_props {
-            let mut g =
-                e.glow.take().unwrap_or(Glow { color: ColorRef::scheme(SchemeSlot::Accent1).with(ColorTransform::Alpha(40000)), radius: 8.0 });
-            if let Some(c) = v.get("color").and_then(color_value) {
-                let a = g.color.alpha();
-                g.color = with_alpha(c, a);
-            }
-            if let Some(t) = num(v, "transparency") {
-                g.color = with_alpha(g.color.clone(), 1.0 - t.clamp(0.0, 1.0));
-            }
-            if let Some(r) = num(v, "radius") {
-                g.radius = r.clamp(0.0, 150.0);
-            }
-            e.glow = (g.radius > 0.0).then_some(g);
-        }
-        if let Some(v) = &refl_props {
-            let mut r = e.reflection.take().unwrap_or(Reflection { blur: 0.5, start_alpha: 0.5, end_alpha: 0.0, end_pos: 0.35, dist: 0.0 });
-            if let Some(t) = num(v, "transparency") {
-                r.start_alpha = 1.0 - t.clamp(0.0, 1.0);
-            }
-            if let Some(sz) = num(v, "size") {
-                r.end_pos = sz.clamp(0.0, 1.0);
-            }
-            if let Some(d) = num(v, "dist") {
-                r.dist = d.clamp(0.0, 100.0);
-            }
-            if let Some(b) = num(v, "blur") {
-                r.blur = b.clamp(0.0, 100.0);
-            }
-            e.reflection = Some(r);
-        }
-        Ok(())
-    })
-}
-
-/// A finite number at `key` of an effect's properties.
-fn num(v: &Value, key: &str) -> Option<f64> {
-    v.get(key).and_then(Value::as_f64).filter(|x| x.is_finite())
-}
-
-/// `c` with its alpha set to `a` (0–1); fully opaque drops the transform.
-fn with_alpha(mut c: ColorRef, a: f64) -> ColorRef {
-    c.mods.retain(|m| !matches!(m, ColorTransform::Alpha(_)));
-    if a < 1.0 {
-        c.mods.push(ColorTransform::Alpha((a.clamp(0.0, 1.0) * 100_000.0).round() as i32));
+    if let (Some(pp), Some(Fill::Picture(pf))) = (pic_props, sh.fill.as_mut()) {
+        picture_props(pf, pp);
     }
-    c
-}
-
-/// Theme quick styles: 7 rows (outline only, solid fill variants, intense…) × 6 accents.
-pub fn quick_style_for(index: usize) -> (ShapeStyle, Option<Fill>, Option<Line>) {
-    let slots = [
-        SchemeSlot::Dk1,
-        SchemeSlot::Accent1,
-        SchemeSlot::Accent2,
-        SchemeSlot::Accent3,
-        SchemeSlot::Accent4,
-        SchemeSlot::Accent5,
-        SchemeSlot::Accent6,
-    ];
-    let slot = slots.get(index % 7).copied().unwrap_or(SchemeSlot::Accent1);
-    let row = index / 7;
-    let mut st = ShapeStyle::accent(slot);
-    let c = ColorRef::scheme(slot);
-    match row {
-        0 => {
-            // Colored outline, light fill.
-            st.fill_ref = (1, ColorRef::scheme(SchemeSlot::Lt1));
-            st.line_ref = (2, c);
-            st.font_ref.1 = Some(ColorRef::scheme(SchemeSlot::Dk1));
-            (st, None, None)
-        }
-        1 => (st, None, None),
-        2 => {
-            st.fill_ref = (1, c.clone().with(ColorTransform::LumMod(20000)).with(ColorTransform::LumOff(80000)));
-            st.line_ref = (0, c.clone());
-            st.font_ref.1 = Some(c.with(ColorTransform::LumMod(50000)));
-            (st, None, Some(Line::none()))
-        }
-        3 => {
-            st.fill_ref = (2, c);
-            (st, None, Some(Line::none()))
-        }
-        4 => {
-            st.fill_ref = (3, c.clone());
-            st.effect_ref = (3, c);
-            (st, None, Some(Line::none()))
-        }
-        _ => {
-            st.fill_ref = (1, c.clone().with(ColorTransform::LumMod(75000)));
-            st.line_ref = (1, ColorRef::scheme(SchemeSlot::Lt1));
-            (st, None, None)
+    if let (Some(t), Some(Fill::Picture(pf))) = (transparency, sh.fill.as_mut()) {
+        let a = 1.0 - t.clamp(0.0, 1.0);
+        pf.alpha = (a < 1.0).then_some(a);
+        return Ok(());
+    }
+    if let Some(t) = transparency {
+        let base = sh.fill.clone().or_else(|| inherited.get(&sh.id).cloned().flatten());
+        if let Some(Fill::Solid { mut color }) = base {
+            color.mods.retain(|m| !matches!(m, ColorTransform::Alpha(_)));
+            if t > 0.0 {
+                color.mods.push(ColorTransform::Alpha(((1.0 - t.clamp(0.0, 1.0)) * 100_000.0).round() as i32));
+            }
+            sh.fill = Some(Fill::Solid { color });
         }
     }
-}
-
-fn quick_style(s: &mut Session, p: &Value) -> Result<Value> {
-    let i = usize_param(p, "index").unwrap_or(1).min(41);
-    let (st, f, l) = quick_style_for(i);
-    edit_shapes(s, p, "shape.quickStyle", |sh| {
-        sh.style = Some(st.clone());
-        sh.fill.clone_from(&f);
-        sh.line.clone_from(&l);
-        sh.effects = None;
-        if let Some(t) = sh.text.as_mut() {
-            deckcraft_model::edit::format_all(t, &|r| r.fill = None);
-        }
-        Ok(())
-    })
+    Ok(())
 }
 
 fn rename(s: &mut Session, p: &Value) -> Result<Value> {
